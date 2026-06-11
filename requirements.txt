@@ -1,0 +1,31 @@
+# ─────────────────────────────────────────────
+#  Core dependencies
+# ─────────────────────────────────────────────
+numpy
+pandas
+opencv-python
+matplotlib
+pyyaml
+tqdm
+
+# ── Detection ──────────────────────────────────
+ultralytics          # YOLOv8
+
+# ── Tracking ───────────────────────────────────
+# DeepSORT itself is cloned as a repo (see scripts/setup_repos.sh),
+# but its appearance encoder needs TensorFlow:
+tensorflow
+
+# ── Kalman filter ───────────────────────────────
+filterpy
+
+# ── Optional: LSTM trajectory predictor ─────────
+# Comment out if you do NOT plan to train/use the LSTM model
+torch
+
+# ── Optional: Depth Anything v2 (depth.method = "depth_anything") ─
+# Comment out if depth.method = "bbox_geometry" (default)
+# (Depth-Anything-V2 repo also required — see scripts/setup_repos.sh)
+# torch already covers this; additionally:
+# einops
+# huggingface_hub
