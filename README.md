@@ -38,6 +38,9 @@ to PowerShell on Windows 11).
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 ```
+```bash
+`. venv/Scripts/activate`
+```
 
 > **If you get an error** like *"running scripts is disabled on this
 > system"*, run this once (per user, no admin needed) and retry:
