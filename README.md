@@ -25,6 +25,7 @@ This README assumes **Windows 11 + VS Code's integrated terminal**
 cd path\to\adas_pipeline
 code .
 ```
+**If using git bash, change "\" to Forward Slash "/"**
 
 Open a new terminal in VS Code: **Terminal → New Terminal** (defaults
 to PowerShell on Windows 11).
