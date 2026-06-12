@@ -34,12 +34,15 @@ to PowerShell on Windows 11).
 
 ## 2. Create and activate a virtual environment
 
+**For Powershell**
 ```powershell
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 ```
+
+**For Bash**
 ```bash
-`. venv/Scripts/activate`
+. venv/Scripts/activate
 ```
 
 > **If you get an error** like *"running scripts is disabled on this
