@@ -3,13 +3,15 @@ modules/predictor.py
 ─────────────────────────────────────────────────────────
 Module 7 — Trajectory Prediction
 
-Given the current Kalman-filtered NPC state [x, y, vx, vy]
-(and optionally ego acceleration), predict the NPC's world
-position for the next `horizon_frames` steps.
+FIX (v2): The CA model now uses the NPC's own Kalman-estimated
+acceleration (state.ax, state.ay) instead of ego vehicle acceleration
+as a proxy.  This removes the coupling between ego manoeuvres and NPC
+predictions — they are independent vehicles.  Ego acceleration is kept
+as a fallback only for the first few frames before the KF has converged.
 
 Three model families are provided:
   • Constant Velocity (CV)      — baseline
-  • Constant Acceleration (CA)  — uses ego ax, ay as a proxy
+  • Constant Acceleration (CA)  — KF-estimated NPC acceleration
   • LSTM (optional)             — learned from npcs.csv trajectories
 """
 
@@ -19,6 +21,10 @@ from dataclasses import dataclass
 from typing import List, Optional
 
 from .kalman_filter import KFState
+
+# Sanity clamp: ignore implausible KF acceleration estimates
+# (can occur in the first few frames before the 6-state KF has converged)
+_MAX_PLAUSIBLE_ACCEL_MS2 = 6.0   # m/s² — generous for CARLA NPC vehicles
 
 
 @dataclass
@@ -61,10 +67,11 @@ class TrajectoryPredictor:
 
         Parameters
         ----------
-        state    : current filtered NPC state.
+        state    : current filtered NPC state (includes ax, ay from 6-state KF).
         dt       : nominal time step (seconds) between future frames.
-        ego_ax, ego_ay : ego acceleration (world frame), used by CA model
-                         as a proxy for NPC acceleration.
+        ego_ax, ego_ay : ego acceleration (world frame) — used as fallback
+                         only when the KF-estimated NPC acceleration is
+                         still unreliable (first few frames).
         history  : optional (T, 4) array of past [x,y,vx,vy] states for LSTM.
         """
         out = []
@@ -86,16 +93,33 @@ class TrajectoryPredictor:
         ], axis=1)
         return TrajectoryPrediction("constant_velocity", pts, dts)
 
-    def predict_ca(self, state: KFState, dt: float,
-                    ax: float = 0.0, ay: float = 0.0) -> TrajectoryPrediction:
+    def predict_ca(
+        self,
+        state: KFState,
+        dt: float,
+        ego_ax: float = 0.0,
+        ego_ay: float = 0.0,
+    ) -> TrajectoryPrediction:
         """
         Constant-acceleration projection.
 
-        Uses the ego vehicle's acceleration as a (rough) proxy for the
-        NPC's acceleration — appropriate for car-following scenarios
-        where the NPC tends to mirror the lead vehicle's behaviour.
+        Uses the KF-estimated NPC acceleration (state.ax, state.ay) when
+        the estimate is within a plausible range.  Falls back to ego
+        acceleration as a proxy only when the KF hasn't converged yet
+        (magnitude exceeds _MAX_PLAUSIBLE_ACCEL_MS2).
+
+        This decouples NPC prediction from ego manoeuvres, which was the
+        main source of spike artefacts in the original implementation.
         """
         dts = np.arange(1, self.horizon + 1) * dt
+
+        npc_a_mag = np.sqrt(state.ax ** 2 + state.ay ** 2)
+        if npc_a_mag <= _MAX_PLAUSIBLE_ACCEL_MS2:
+            ax, ay = state.ax, state.ay     # KF-estimated NPC acceleration
+        else:
+            # KF not yet converged — use ego proxy (original behaviour)
+            ax, ay = ego_ax, ego_ay
+
         pts = np.stack([
             state.x + state.vx * dts + 0.5 * ax * dts ** 2,
             state.y + state.vy * dts + 0.5 * ay * dts ** 2,
@@ -127,7 +151,7 @@ class TrajectoryPredictor:
     def _load_lstm(self, cfg: dict):
         try:
             import torch
-            from .lstm_model import TrajLSTM   # see modules/lstm_model.py
+            from .lstm_model import TrajLSTM
 
             lstm_cfg = cfg["lstm"]
             model = TrajLSTM(
