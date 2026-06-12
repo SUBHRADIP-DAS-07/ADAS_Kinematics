@@ -11,14 +11,20 @@ Two methods are supported:
                       Produces a full depth map; scale is calibrated
                       against dist_to_ego from the first N frames.
 
-The output in both cases is a metric depth estimate in metres and a
-3D point in the CARLA camera coordinate frame.
+FIX (v2): bbox_geometry now uses the gt_dist_m signal (passed from
+npcs.csv dist_to_ego) to calibrate a multiplicative scale factor over
+the first N frames.  This corrects a systematic ~4 m under-estimation
+caused by the YOLO bbox height being larger than the assumed physical
+vehicle height (camera elevation + perspective effects).  The calibrated
+scale is printed once and applied for the rest of the run.  If gt_dist_m
+is never supplied (real-world deployment with no GT), the estimator falls
+back gracefully to the raw formula.
 """
 
 from __future__ import annotations
 import numpy as np
-from dataclasses import dataclass
-from typing import Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, List, Tuple
 
 from .detector import Detection
 
@@ -66,10 +72,24 @@ class DepthEstimator:
         print(f"[DepthEst] Intrinsics — f={self.f:.1f}px, "
               f"cx={self.cx_img}, cy={self.cy_img}")
 
+        # ── bbox_geometry online calibration ─────────────────────────────────
+        # Accumulates (raw_depth, gt_dist) pairs for the first N frames and
+        # computes a multiplicative scale: scale = median(gt_dist / raw_depth).
+        # This corrects errors from: camera elevation perspective, bbox padding,
+        # and the approximate known_vehicle_height_m assumption.
+        self._n_calib:          int   = self.dep_cfg.get("scale_calibration_frames", 20)
+        self._bbox_calib_buf:   List[Tuple[float, float]] = []
+        self._bbox_scale:       float = 1.0     # applied once calibrated
+        self._bbox_calibrated:  bool  = False
+
+        # Configurable depth clamp (metres)
+        self._min_depth: float = self.dep_cfg.get("min_depth_m", 5.0)
+        self._max_depth: float = self.dep_cfg.get("max_depth_m", 60.0)
+
         # ── Depth Anything (optional) ────────────────────────────────────────
         self._da_model    = None
         self._da_scale    = None   # calibrated scale factor (relative → metric)
-        self._calib_buf   = []     # list of (relative_depth, gt_distance_m) pairs
+        self._da_calib_buf: List[Tuple[float, float]] = []
         if self.method == "depth_anything":
             self._load_depth_anything()
 
@@ -88,13 +108,14 @@ class DepthEstimator:
         ----------
         det        : Detection bounding box in pixel space.
         frame      : BGR image (required for depth_anything method).
-        gt_dist_m  : Ground-truth distance in metres (used only for
-                     calibrating the depth_anything scale factor).
+        gt_dist_m  : Ground-truth distance in metres — used to calibrate
+                     the depth scale factor for the first N frames.
+                     Safe to omit in real-world (non-GT) deployments.
         """
         if self.method == "depth_anything" and self._da_model is not None:
             return self._estimate_depth_anything(det, frame, gt_dist_m)
         else:
-            return self._estimate_bbox_geometry(det)
+            return self._estimate_bbox_geometry(det, gt_dist_m)
 
     def pixel_to_camera(self, px: float, py: float, depth_m: float) -> np.ndarray:
         """Back-project a pixel (px, py) at known depth to camera-frame 3D."""
@@ -105,20 +126,50 @@ class DepthEstimator:
 
     # ── Method A — Bounding-box geometry ─────────────────────────────────────
 
-    def _estimate_bbox_geometry(self, det: Detection) -> DepthEstimate:
+    def _estimate_bbox_geometry(
+        self,
+        det: Detection,
+        gt_dist_m: Optional[float] = None,
+    ) -> DepthEstimate:
         """
         Estimate depth from apparent bounding-box height and known object height.
 
-        depth ≈ (known_height_m × f_px) / bbox_height_px
+            depth_raw ≈ (known_height_m × f_px) / bbox_height_px
 
         Audi TT roof height ≈ 1.34 m (matches npcs type_id vehicle.audi.tt).
+
+        Online calibration
+        ------------------
+        If gt_dist_m is provided for the first N frames, a multiplicative
+        scale factor is computed:
+            scale = median( gt_dist_i / depth_raw_i )
+        and applied as:
+            depth_calibrated = depth_raw * scale
+        This corrects the systematic under-estimation from camera elevation
+        and bounding-box padding effects.
         """
         h_known = self.dep_cfg["known_vehicle_height_m"]   # 1.34 m
         h_px    = max(det.height, 1e-3)                    # avoid div-by-zero
-        depth   = (h_known * self.f) / h_px
+        depth_raw = (h_known * self.f) / h_px
 
-        # Clamp to plausible range for this scene (5 m – 60 m)
-        depth = float(np.clip(depth, 5.0, 60.0))
+        # ── Online scale calibration (uses GT dist from npcs.csv) ────────────
+        if gt_dist_m is not None and not self._bbox_calibrated:
+            if depth_raw > 1.0:   # sanity — skip degenerate boxes
+                self._bbox_calib_buf.append((depth_raw, float(gt_dist_m)))
+
+            if len(self._bbox_calib_buf) >= self._n_calib:
+                scales = [gt / raw for raw, gt in self._bbox_calib_buf]
+                self._bbox_scale = float(np.median(scales))
+                self._bbox_calibrated = True
+                effective_h = h_known * self._bbox_scale
+                print(f"[DepthEst] bbox_geometry scale calibrated → "
+                      f"{self._bbox_scale:.4f}  "
+                      f"(effective vehicle height: {effective_h:.3f} m  "
+                      f"from {self._n_calib} frames)")
+
+        # Apply calibrated scale and clamp to plausible range
+        depth = float(np.clip(depth_raw * self._bbox_scale,
+                               self._min_depth, self._max_depth))
         point = self.pixel_to_camera(det.cx, det.cy, depth)
         return DepthEstimate(depth_m=depth, point_cam=point,
                              method="bbox_geometry")
@@ -136,34 +187,34 @@ class DepthEstimator:
         Calibrate scale factor against gt_dist_m for the first N frames.
         """
         if frame is None:
-            return self._estimate_bbox_geometry(det)
+            return self._estimate_bbox_geometry(det, gt_dist_m)
 
         depth_map = self._da_model.infer_image(frame)   # relative depth [0,1]
 
         # Sample median of a 20×20 patch at bbox centre
-        x1, y1, x2, y2 = [int(v) for v in det.bbox]
         bx, by = int(det.cx), int(det.cy)
         patch  = depth_map[max(0,by-10):by+10, max(0,bx-10):bx+10]
         rel_d  = float(np.median(patch)) if patch.size > 0 else float(np.median(depth_map))
 
         # Calibrate scale
-        n_calib = self.dep_cfg["scale_calibration_frames"]
-        if gt_dist_m is not None and len(self._calib_buf) < n_calib:
+        if gt_dist_m is not None and len(self._da_calib_buf) < self._n_calib:
             if rel_d > 1e-6:
-                self._calib_buf.append(gt_dist_m / rel_d)
-                if len(self._calib_buf) == n_calib:
-                    self._da_scale = float(np.median(self._calib_buf))
+                self._da_calib_buf.append((rel_d, float(gt_dist_m)))
+                if len(self._da_calib_buf) == self._n_calib:
+                    self._da_scale = float(
+                        np.median([gt / rd for rd, gt in self._da_calib_buf])
+                    )
                     print(f"[DepthEst] DA scale calibrated → {self._da_scale:.2f}")
 
         scale = self._da_scale if self._da_scale else 10.0   # rough fallback
-        depth = float(np.clip(rel_d * scale, 5.0, 60.0))
+        depth = float(np.clip(rel_d * scale, self._min_depth, self._max_depth))
         point = self.pixel_to_camera(det.cx, det.cy, depth)
         return DepthEstimate(depth_m=depth, point_cam=point,
                              method="depth_anything")
 
     def _load_depth_anything(self):
         try:
-            import sys, os
+            import sys
             sys.path.append("Depth-Anything-V2")
             import torch
             from depth_anything_v2.dpt import DepthAnythingV2
