@@ -1,5 +1,5 @@
 # ─────────────────────────────────────────────
-#  ADAS Pipeline Configuration
+#  ADAS Pipeline Configuration  (v2)
 # ─────────────────────────────────────────────
 
 # ── Paths ──────────────────────────────────────
@@ -35,9 +35,16 @@ detection:
 depth:
   method: "bbox_geometry"       # "bbox_geometry" | "depth_anything"
   known_vehicle_height_m: 1.34  # Audi TT height (matches npcs type_id)
+  # Online calibration: uses gt dist_to_ego from the first N frames to
+  # compute a multiplicative scale that corrects for camera elevation,
+  # bbox padding, and the approximate vehicle height assumption.
+  # Set to 0 to disable calibration (raw formula only).
+  scale_calibration_frames: 20
+  # Configurable depth clamp (metres)
+  min_depth_m:  5.0
+  max_depth_m: 60.0
   depth_anything_checkpoint: "checkpoints/depth_anything_v2_vits.pth"
   depth_anything_encoder: "vits"
-  scale_calibration_frames: 20  # frames used to fit depth scale factor
 
 # ── Tracking (DeepSORT) ────────────────────────
 tracking:
@@ -47,12 +54,18 @@ tracking:
   feature_dim: 128
 
 # ── Kalman Filter ──────────────────────────────
+# v2: upgraded to 6-state constant-acceleration model [x, y, vx, vy, ax, ay].
+# After depth calibration the measurements are ~4 m more accurate, so
+# observation_noise_var is reduced from 2.0 → 1.5 (trust measurements more).
+# process_noise_accel_var governs how quickly the KF allows acceleration
+# to change; 0.8 works well for typical CARLA NPC behaviour.
 kalman:
-  # State: [x, y, vx, vy]
-  observation_noise_var: 2.0    # R — tune up if depth is noisy
-  process_noise_var: 0.1        # Q — low because CARLA NPC moves smoothly
-  initial_uncertainty: 10.0     # P diagonal init
-  default_dt: 0.05              # fallback if sim_time delta is zero
+  # State: [x, y, vx, vy, ax, ay]
+  observation_noise_var:   1.5  # R — reduced from 2.0 (depth calibration helps)
+  process_noise_var:       0.1  # Q position/velocity block (NPC moves smoothly)
+  process_noise_accel_var: 0.8  # Q acceleration block (allows speed changes)
+  initial_uncertainty:    10.0  # P diagonal init
+  default_dt:             0.05  # fallback if sim_time delta is zero
 
 # ── Prediction ─────────────────────────────────
 prediction:
