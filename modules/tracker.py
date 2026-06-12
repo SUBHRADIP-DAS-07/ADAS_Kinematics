@@ -124,8 +124,21 @@ class VehicleTracker:
 
         ds_dets = []
         for d in detections:
-            # Stub feature vector (replace with a real Re-ID encoder if needed)
-            feature = np.zeros(self.cfg["feature_dim"], dtype=np.float32)
+            # Skip degenerate bounding boxes — zero-area crops cause zero-norm
+            # features which produce NaN in DeepSORT's cosine distance metric.
+            if d.area < 1.0:
+                continue
+
+            # Stub appearance feature: a constant unit vector.
+            # np.zeros() must NOT be used here — a zero-norm vector divided
+            # during cosine normalisation produces NaN which crashes
+            # linear_sum_assignment with "matrix contains invalid numeric entries".
+            # A constant unit vector means all detections look identical to the
+            # appearance metric, so DeepSORT falls back to pure motion (Kalman)
+            # for association — correct behaviour when no real Re-ID encoder exists.
+            dim = self.cfg["feature_dim"]
+            feature = np.full(dim, 1.0 / np.sqrt(dim), dtype=np.float32)
+
             ds_dets.append(DSDetection(d.tlwh, d.conf, feature))
 
         self._ds_tracker.predict()
